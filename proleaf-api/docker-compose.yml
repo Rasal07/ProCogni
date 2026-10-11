@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: proleaf
+      POSTGRES_PASSWORD: proleaf
+      POSTGRES_DB: proleaf
+    ports:
+      - "5432:5432"
+    volumes:
+      - proleaf-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proleaf -d proleaf"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PROLEAF_ENV: dev
+      PROLEAF_HTTP_ADDR: ":8080"
+      PROLEAF_DATABASE_URL: postgres://proleaf:proleaf@db:5432/proleaf?sslmode=disable
+      PROLEAF_SMS_PROVIDER: log
+      # Dev-only values. Outside dev these are required and the service
+      # refuses to start without them.
+      PROLEAF_TOKEN_SECRET: dev-token-secret-change-me-0000000000
+      PROLEAF_OTP_PEPPER: dev-otp-pepper-change-me-00000000000
+      PROLEAF_ENROLLMENT_CODE_PEPPER: dev-code-pepper-change-me-0000000000
+    ports:
+      - "8080:8080"
+
+  # The API over in-memory fake data, for frontend work. No database.
+  #   docker compose up mock      -> http://localhost:8090/v1
+  mock:
+    build: .
+    entrypoint: ["/mock"]
+    ports:
+      - "8090:8080"
+
+volumes:
+  proleaf-pgdata:

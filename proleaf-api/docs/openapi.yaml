@@ -1,0 +1,1354 @@
+openapi: 3.0.3
+info:
+  title: ProLeaf API
+  version: "1.0.0"
+  description: |
+    The contract between the ProLeaf backend and its clients.
+
+    **Versioning.** Every route below is served under `/v1`. A breaking change
+    gets a new prefix mounted next to this one; additive changes (new routes,
+    new optional fields) do not. Clients must ignore response fields they do
+    not recognise. `GET /healthz` is unversioned and is for load balancers.
+
+    **Auth.** Sign in with phone + OTP, then send the token as
+    `Authorization: Bearer <token>`. A token carries one role and is accepted
+    only on that role's prefix: `/teacher/*`, `/parent/*` or `/admin/*`.
+
+    **Errors.** Every non-2xx response, including unknown routes and wrong
+    methods, has the same JSON body:
+
+        {
+          "error": { "code": "invalid", "message": "...", "details": { } },
+          "request_id": "9f2c..."
+        }
+
+    Branch on `error.code`, never on `message`. `request_id` is also returned
+    as the `X-Request-Id` header on every response; quote it in bug reports.
+
+    | HTTP | code | meaning |
+    |---|---|---|
+    | 400 | `invalid` | the body or a parameter failed validation; `message` says which |
+    | 401 | `unauthorized` | missing, malformed or expired token |
+    | 401 | `otp_invalid` | OTP wrong, expired, used, or the account is disabled |
+    | 403 | `forbidden` | valid token, wrong role for this prefix (or account disabled) |
+    | 403 | `consent_required` | the guardian has no current consent for this data |
+    | 404 | `not_found` | no such route, or no such object *that you may see* |
+    | 404 | `code_not_usable` | enrollment code unknown, expired, used or revoked |
+    | 404 | `student_not_in_your_classes` | a bulk entry names a student you do not teach; `details.index` |
+    | 405 | `method_not_allowed` | the route exists, not for this method; see `Allow` |
+    | 409 | `policy_version_mismatch` | consent given against a superseded policy text |
+    | 409 | `already_bound` | this account is already bound to that student |
+    | 409 | `code_not_revocable` | enrollment code already consumed or revoked |
+    | 429 | `rate_limited` | OTP requested again too soon, or too many wrong attempts |
+    | 500 | `internal` | our fault; nothing in the body beyond the request id |
+
+    On `/teacher/*` and `/parent/*` an object you are not allowed to see is a
+    404, never a 403, and so is a malformed id. That is deliberate: a 403
+    would confirm the id names a real student.
+
+    **Dates.** Calendar dates in requests are `YYYY-MM-DD`. Timestamps are
+    RFC 3339 UTC. `session_date` in *responses* is currently a timestamp at
+    midnight UTC (`2026-10-02T00:00:00Z`); read the date part.
+
+servers:
+  - url: http://localhost:8080/v1
+    description: Local API, or the mock server (`go run ./cmd/mock`)
+
+tags:
+  - name: auth
+  - name: teacher
+  - name: parent
+  - name: admin
+
+paths:
+  /auth/otp/request:
+    post:
+      tags: [auth]
+      summary: Send a one-time code by SMS
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone:
+                  type: string
+                  description: E.164, or a bare 11-digit mainland mobile.
+                  example: "13800138000"
+      responses:
+        "202":
+          description: Handed to the SMS gateway (not necessarily delivered yet).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: sent }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /auth/otp/verify:
+    post:
+      tags: [auth]
+      summary: Exchange a code for a bearer token
+      description: |
+        A phone seen for the first time becomes a **parent** account. Teacher
+        and admin accounts must be provisioned first; the role in the response
+        tells the client which app shell to show.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              properties:
+                phone: { type: string, example: "13800138000" }
+                code: { type: string, example: "123456" }
+      responses:
+        "200":
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Token" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401":
+          description: "`otp_invalid`. One answer for every failure mode."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /teacher/classes:
+    get:
+      tags: [teacher]
+      summary: Classes this teacher is assigned to
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  classes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Class" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /teacher/classes/{id}/students:
+    get:
+      tags: [teacher]
+      summary: Roster of one class
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  students:
+                    type: array
+                    items: { $ref: "#/components/schemas/Student" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /teacher/assessments:
+    post:
+      tags: [teacher]
+      summary: Record one assessment
+      description: A batch of one. `session_date` defaults to today (UTC).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NewAssessment" }
+      responses:
+        "201":
+          description: Recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Recorded" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /teacher/assessments/bulk:
+    post:
+      tags: [teacher]
+      summary: Record a day of assessments in one call
+      description: |
+        All-or-nothing, at most 500 entries. On failure `error.details.index`
+        is the zero-based index of the entry that was rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [entries]
+              properties:
+                session_date:
+                  type: string
+                  format: date
+                  description: Default for entries that omit their own.
+                  example: "2026-10-02"
+                entries:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { $ref: "#/components/schemas/NewAssessment" }
+      responses:
+        "201":
+          description: Recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Recorded" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /teacher/students/{id}/history:
+    get:
+      tags: [teacher]
+      summary: A student's assessment history, newest first
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/Assessment" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /parent/bind:
+    post:
+      tags: [parent]
+      summary: Bind this account to a child with an enrollment code
+      description: |
+        The client must send the `policy_version` it displayed and the consent
+        scopes the guardian accepted. `progress` is required to bind;
+        `comparison` is optional and a declined scope is recorded as a refusal.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enrollment_code, policy_version, accepted_scopes]
+              properties:
+                enrollment_code: { type: string, example: "K7M2-9QHT-4RXB" }
+                policy_version: { type: string, example: "2026-01-01" }
+                accepted_scopes:
+                  type: array
+                  items: { $ref: "#/components/schemas/ConsentScope" }
+                  example: [progress, comparison]
+      responses:
+        "201":
+          description: Bound.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  student: { $ref: "#/components/schemas/Student" }
+                  consent:
+                    type: array
+                    items: { $ref: "#/components/schemas/ConsentStatus" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: "`code_not_usable`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "409":
+          description: "`policy_version_mismatch` or `already_bound`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /parent/children:
+    get:
+      tags: [parent]
+      summary: Children this account is bound to
+      description: Not consent-gated, so a guardian who withdrew consent can still find the child to grant it again.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  children:
+                    type: array
+                    items: { $ref: "#/components/schemas/Student" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /parent/children/{id}/progress:
+    get:
+      tags: [parent]
+      summary: The child's own assessment history (numbers only)
+      description: Requires current consent for the `progress` scope.
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - name: limit
+          in: query
+          schema: { type: integer, default: 60, maximum: 200 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/ParentSession" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ForbiddenOrConsent" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /parent/children/{id}/comparison:
+    get:
+      tags: [parent]
+      summary: The child's monthly mean against class aggregates
+      description: |
+        Requires current consent for the `comparison` scope. The response
+        carries no identifiers of any kind. When `class` is null,
+        `unavailable` says why: `not_computed` (the stats job has not run for
+        that month) or `cohort_too_small` (too few students to publish).
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - name: period
+          in: query
+          description: Month as `YYYY-MM`; defaults to the current month.
+          schema: { type: string, example: "2026-10" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Comparison" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ForbiddenOrConsent" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /parent/children/{id}/consent:
+    get:
+      tags: [parent]
+      summary: Current consent decisions for one child
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsentState" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [parent]
+      summary: Grant or withdraw one consent scope
+      description: A grant must name the current `policy_version`; a withdrawal need not.
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, granted]
+              properties:
+                scope: { $ref: "#/components/schemas/ConsentScope" }
+                granted: { type: boolean }
+                policy_version: { type: string, example: "2026-01-01" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConsentState" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`policy_version_mismatch`"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /parent/requests:
+    post:
+      tags: [parent]
+      summary: Submit a data-subject request (access, correction, deletion)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [access, correction, deletion] }
+                student_id: { type: string, format: uuid }
+                detail: { type: string }
+      responses:
+        "202":
+          description: Recorded; fulfilment is a staff workflow.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SubjectRequest" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/schools:
+    post:
+      tags: [admin]
+      summary: Create a school
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NameBody" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/School" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    get:
+      tags: [admin]
+      summary: List schools
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schools:
+                    type: array
+                    items: { $ref: "#/components/schemas/School" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/schools/{id}:
+    patch:
+      tags: [admin]
+      summary: Rename a school
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NameBody" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/School" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/classes:
+    post:
+      tags: [admin]
+      summary: Create a class
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, cat_stage, academic_year]
+              properties:
+                name: { type: string, example: CAT4 Blue }
+                cat_stage: { type: integer, minimum: 3, maximum: 5 }
+                academic_year: { type: string, example: "2026" }
+                school_id: { type: string, format: uuid }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Class" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    get:
+      tags: [admin]
+      summary: List classes
+      parameters:
+        - name: school_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  classes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Class" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/classes/{id}:
+    get:
+      tags: [admin]
+      summary: One class with its assigned teachers
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Class"
+                  - type: object
+                    properties:
+                      teachers:
+                        type: array
+                        items: { $ref: "#/components/schemas/Account" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [admin]
+      summary: Update a class
+      description: Send only the fields to change. `cat_stage` cannot be changed.
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                academic_year: { type: string }
+                school_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Class" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/classes/{id}/teachers:
+    post:
+      tags: [admin]
+      summary: Assign a teacher to a class
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_id]
+              properties:
+                account_id: { type: string, format: uuid }
+      responses:
+        "201":
+          description: Assigned (idempotent).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: assigned }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/classes/{id}/teachers/{account_id}:
+    delete:
+      tags: [admin]
+      summary: Remove a teacher from a class
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/account_id"
+      responses:
+        "204": { description: Removed. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/classes/{id}/enrollment-codes:
+    post:
+      tags: [admin]
+      summary: Issue one enrollment code per student in a class
+      description: |
+        The distribution step: the response is the sheet a school prints and
+        sends home. Plaintext codes appear here once and are not recoverable.
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "201":
+          description: Issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  codes:
+                    type: array
+                    items: { $ref: "#/components/schemas/IssuedCode" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/students:
+    post:
+      tags: [admin]
+      summary: Create a student
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name, cat_stage, class_id, date_of_birth]
+              properties:
+                display_name: { type: string, example: 王梓涵 }
+                cat_stage: { type: integer, minimum: 3, maximum: 5, description: Must equal the class's stage. }
+                class_id: { type: string, format: uuid }
+                date_of_birth: { type: string, format: date, example: "2016-05-01" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Student" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    get:
+      tags: [admin]
+      summary: Roster of one class
+      parameters:
+        - name: class_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: include_archived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  students:
+                    type: array
+                    items: { $ref: "#/components/schemas/Student" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/students/{id}:
+    get:
+      tags: [admin]
+      summary: One student with their bound guardians
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Student"
+                  - type: object
+                    properties:
+                      guardians:
+                        type: array
+                        items: { $ref: "#/components/schemas/Guardian" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [admin]
+      summary: Rename a student or move them to another class
+      description: Send only the fields to change. Moving class sets `cat_stage` to the new class's stage.
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                class_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Student" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/students/{id}/archive:
+    post:
+      tags: [admin]
+      summary: Archive a student
+      description: Removes the student from rosters and from parent and teacher routes. Nothing is deleted.
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Student" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/students/{id}/restore:
+    post:
+      tags: [admin]
+      summary: Restore an archived student
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Student" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/students/{id}/guardians/{account_id}:
+    delete:
+      tags: [admin]
+      summary: Revoke a guardian's binding to a student
+      description: Takes effect on the guardian's next request. Re-binding needs a new enrollment code.
+      parameters:
+        - $ref: "#/components/parameters/id"
+        - $ref: "#/components/parameters/account_id"
+      responses:
+        "204": { description: Revoked. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/accounts:
+    post:
+      tags: [admin]
+      summary: Provision a staff account
+      description: Teachers and admins only; parents come from OTP sign-in. Returns the existing account if the phone is already known.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, role]
+              properties:
+                phone: { type: string, example: "13900139000" }
+                role: { type: string, enum: [teacher, admin] }
+                display_name: { type: string, example: 李老师 }
+      responses:
+        "201":
+          description: Created (or already existed).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    get:
+      tags: [admin]
+      summary: List accounts
+      parameters:
+        - name: role
+          in: query
+          schema: { $ref: "#/components/schemas/Role" }
+        - name: phone
+          in: query
+          description: Exact match after normalisation.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 100, maximum: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/accounts/{id}:
+    get:
+      tags: [admin]
+      summary: One account
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [admin]
+      summary: Change an account's display name
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name]
+              properties:
+                display_name: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/accounts/{id}/disable:
+    post:
+      tags: [admin]
+      summary: Disable an account
+      description: Takes effect on the account's next request; its tokens stop working. An admin cannot disable themself.
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/accounts/{id}/enable:
+    post:
+      tags: [admin]
+      summary: Re-enable a disabled account
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Account" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /admin/enrollment-codes:
+    post:
+      tags: [admin]
+      summary: Issue an enrollment code for one student
+      description: |
+        The plaintext `code` is returned here once and never again. A student
+        may hold several live codes, one per guardian. Codes are single-use and
+        expire after the configured TTL (14 days by default).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [student_id]
+              properties:
+                student_id: { type: string, format: uuid }
+      responses:
+        "201":
+          description: Issued.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IssuedCode" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    get:
+      tags: [admin]
+      summary: List enrollment codes and their status
+      description: Exactly one of `student_id` or `class_id` is required. Plaintext codes are never listed.
+      parameters:
+        - name: student_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: class_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  codes:
+                    type: array
+                    items: { $ref: "#/components/schemas/EnrollmentCode" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/enrollment-codes/{id}/revoke:
+    post:
+      tags: [admin]
+      summary: Revoke an unused enrollment code
+      parameters:
+        - $ref: "#/components/parameters/id"
+      responses:
+        "200":
+          description: Revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`code_not_revocable`: already consumed or revoked."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /admin/audit:
+    get:
+      tags: [admin]
+      summary: Read the audit log, newest first
+      parameters:
+        - name: stream
+          in: query
+          schema: { type: string, enum: [app, admin] }
+        - name: actor
+          in: query
+          schema: { type: string, format: uuid }
+        - name: subject
+          in: query
+          description: Student id.
+          schema: { type: string, format: uuid }
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+        - name: until
+          in: query
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 200, maximum: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditEntry" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/subject-requests:
+    get:
+      tags: [admin]
+      summary: List data-subject requests
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [received, in_progress, fulfilled, refused] }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requests:
+                    type: array
+                    items: { $ref: "#/components/schemas/SubjectRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /admin/subject-requests/{id}/status:
+    post:
+      tags: [admin]
+      summary: Record the outcome of a data-subject request
+      description: Records the status only. Marking a deletion fulfilled does not delete anything.
+      parameters:
+        - $ref: "#/components/parameters/id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [in_progress, fulfilled, refused] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+security:
+  - bearer: []
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    account_id:
+      name: account_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Invalid:
+      description: "`invalid`: validation failed."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+          example:
+            error: { code: invalid, message: score must be between 0 and 100, details: { index: 3 } }
+            request_id: 4b1d0c6f2a9e4f0f8a3c5d7e9b1a2c3d
+    Unauthorized:
+      description: "`unauthorized`: no valid token."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Forbidden:
+      description: "`forbidden`: the token's role does not own this prefix."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    ForbiddenOrConsent:
+      description: "`forbidden` (wrong role) or `consent_required` (prompt the guardian for consent)."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: "`not_found`: no such object, or not one this caller may see."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    RateLimited:
+      description: "`rate_limited`"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error, request_id]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, description: Stable and machine-readable. Branch on this. }
+            message: { type: string, description: Short English text for developers. Not for display. }
+            details: { type: object, additionalProperties: true }
+        request_id: { type: string }
+
+    Role:
+      type: string
+      enum: [teacher, parent, admin]
+
+    ConsentScope:
+      type: string
+      enum: [progress, comparison]
+
+    NameBody:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 200 }
+
+    Token:
+      type: object
+      properties:
+        token: { type: string }
+        expires_at: { type: string, format: date-time }
+        role: { $ref: "#/components/schemas/Role" }
+        account_id: { type: string, format: uuid }
+
+    School:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: 浦东实验小学 }
+        created_at: { type: string, format: date-time }
+
+    Class:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: CAT4 Blue }
+        cat_stage: { type: integer, minimum: 3, maximum: 5 }
+        academic_year: { type: string, example: "2026" }
+        student_count: { type: integer, description: Active (non-archived) students. }
+        school_id: { type: string, format: uuid, description: Admin routes only; absent when unset. }
+
+    Student:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        display_name: { type: string, example: 王梓涵 }
+        cat_stage: { type: integer }
+        class_id: { type: string, format: uuid }
+        archived_at: { type: string, format: date-time, description: Present only when archived. }
+
+    Guardian:
+      type: object
+      properties:
+        account_id: { type: string, format: uuid }
+        phone: { type: string, example: "+8613800138000" }
+        bound_at: { type: string, format: date-time }
+
+    Account:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string, example: "+8613900139000" }
+        role: { $ref: "#/components/schemas/Role" }
+        display_name: { type: string }
+        disabled_at: { type: string, format: date-time, description: Present only when disabled. }
+
+    NewAssessment:
+      type: object
+      required: [student_id]
+      description: At least one of `score`, `participation` or `note` is required.
+      properties:
+        student_id: { type: string, format: uuid }
+        session_date: { type: string, format: date, description: Not in the future. }
+        score: { type: number, minimum: 0, maximum: 100, nullable: true }
+        participation: { type: integer, minimum: 0, maximum: 5, nullable: true }
+        note: { type: string, maxLength: 2000, description: Teacher-only; never shown to parents. }
+
+    Recorded:
+      type: object
+      properties:
+        recorded: { type: integer }
+        assessment_ids:
+          type: array
+          items: { type: string, format: uuid }
+
+    Assessment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        student_id: { type: string, format: uuid }
+        recorded_by: { type: string, format: uuid }
+        session_date: { type: string, format: date-time, example: "2026-10-02T00:00:00Z" }
+        score: { type: number, nullable: true }
+        participation: { type: integer, nullable: true }
+        note: { type: string }
+        created_at: { type: string, format: date-time }
+
+    ParentSession:
+      type: object
+      properties:
+        session_date: { type: string, format: date-time, example: "2026-10-02T00:00:00Z" }
+        score: { type: number, nullable: true }
+        participation: { type: integer, nullable: true }
+
+    Comparison:
+      type: object
+      properties:
+        period: { type: string, example: "2026-10" }
+        own_score: { type: number, nullable: true, description: The child's mean for the month. }
+        session_count: { type: integer }
+        class:
+          nullable: true
+          type: object
+          properties:
+            mean_score: { type: number }
+            median_score: { type: number }
+            top_score: { type: number }
+            student_count: { type: integer }
+        unavailable:
+          type: string
+          enum: [not_computed, cohort_too_small]
+          description: Present only when `class` is null.
+
+    ConsentStatus:
+      type: object
+      properties:
+        scope: { $ref: "#/components/schemas/ConsentScope" }
+        granted: { type: boolean }
+        current: { type: boolean, description: Granted under the policy now in force. This is the one to gate UI on. }
+        policy_version: { type: string }
+        occurred_at: { type: string, format: date-time }
+
+    ConsentState:
+      type: object
+      properties:
+        policy_version: { type: string, description: The policy now in force; display and send this one. }
+        consent:
+          type: array
+          items: { $ref: "#/components/schemas/ConsentStatus" }
+
+    SubjectRequest:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        student_id: { type: string, format: uuid }
+        kind: { type: string, enum: [access, correction, deletion] }
+        status: { type: string, enum: [received, in_progress, fulfilled, refused] }
+        detail: { type: string }
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time }
+
+    IssuedCode:
+      type: object
+      properties:
+        id: { type: string, format: uuid, description: Use this to revoke. }
+        code: { type: string, example: "K7M2-9QHT-4RXB", description: Shown once. }
+        student_id: { type: string, format: uuid }
+        display_name: { type: string, description: Class sheet only. }
+        expires_at: { type: string, format: date-time }
+
+    EnrollmentCode:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        student_id: { type: string, format: uuid }
+        issued_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        consumed_at: { type: string, format: date-time }
+        revoked_at: { type: string, format: date-time }
+        status: { type: string, enum: [active, consumed, revoked, expired] }
+
+    AuditEntry:
+      type: object
+      properties:
+        actor_account: { type: string, format: uuid }
+        actor_role: { $ref: "#/components/schemas/Role" }
+        action: { type: string, example: view_progress }
+        subject_student: { type: string, format: uuid, nullable: true }
+        request_id: { type: string }
+        stream: { type: string, enum: [app, admin] }
+        occurred_at: { type: string, format: date-time }
